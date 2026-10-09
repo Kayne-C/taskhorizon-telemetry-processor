@@ -84,6 +84,71 @@ public sealed class PartitionLease : IAsyncDisposable
     }
 }
 
+public sealed class NodeMembership : IAsyncDisposable
+{
+    public const int KeyFloor = 1_000_000;
+    public const int KeyCeiling = 1_900_000_000;
+
+    private readonly NpgsqlConnection _connection;
+
+    private NodeMembership(NpgsqlConnection connection, int key)
+    {
+        _connection = connection;
+        Key = key;
+    }
+
+    public int Key { get; }
+
+    public static async Task<NodeMembership> JoinAsync(NpgsqlDataSource dataSource, CancellationToken ct)
+    {
+        var connection = await dataSource.OpenConnectionAsync(ct);
+        try
+        {
+            while (true)
+            {
+                var key = Random.Shared.Next(KeyFloor, KeyCeiling);
+                await using var cmd = new NpgsqlCommand("SELECT pg_try_advisory_lock(@ns, @key)", connection);
+                cmd.Parameters.AddWithValue("ns", Schema.AdvisoryNamespace);
+                cmd.Parameters.AddWithValue("key", key);
+                if (await cmd.ExecuteScalarAsync(ct) is true)
+                {
+                    return new NodeMembership(connection, key);
+                }
+            }
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
+    }
+
+    public async Task<int> LiveNodesAsync(CancellationToken ct)
+    {
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(DISTINCT objid) FROM pg_locks WHERE locktype = 'advisory' AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) AND classid = @ns AND objsubid = 2 AND objid >= @floor AND objid < @ceiling AND granted",
+            _connection);
+        cmd.Parameters.AddWithValue("ns", Schema.AdvisoryNamespace);
+        cmd.Parameters.AddWithValue("floor", KeyFloor);
+        cmd.Parameters.AddWithValue("ceiling", KeyCeiling);
+        return Math.Max(1, Convert.ToInt32(await cmd.ExecuteScalarAsync(ct)));
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            await using var cmd = new NpgsqlCommand("SELECT pg_advisory_unlock_all()", _connection);
+            await cmd.ExecuteNonQueryAsync();
+        }
+        catch (Exception)
+        {
+        }
+
+        await _connection.DisposeAsync();
+    }
+}
+
 public sealed class IngestStats
 {
     private long _events;
@@ -143,6 +208,9 @@ public sealed class IngestEngine(
 {
     private readonly TaskCompletionSource _done = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private SemaphoreSlim? _commitGate;
+    private NodeMembership? _membership;
+    private int _owned;
+    private int _fairShare;
 
     public Task Completion => _done.Task;
 
@@ -158,14 +226,78 @@ public sealed class IngestEngine(
         await Task.Yield();
         stats.Start(source.Partitions);
         _commitGate = new SemaphoreSlim(o.MaxConcurrentCommits);
+        _fairShare = source.Partitions;
         try
         {
-            await Task.WhenAll(Enumerable.Range(0, source.Partitions).Select(p => Task.Run(async () => await RunPartitionAsync(p, stoppingToken), stoppingToken)));
+            _membership = await NodeMembership.JoinAsync(dataSource, stoppingToken);
+            using var refreshCts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+            var refresh = Task.Run(async () => await RefreshFairShareAsync(refreshCts.Token), refreshCts.Token);
+            try
+            {
+                await Task.WhenAll(Enumerable.Range(0, source.Partitions).Select(p => Task.Run(async () => await RunPartitionAsync(p, stoppingToken), stoppingToken)));
+            }
+            finally
+            {
+                await refreshCts.CancelAsync();
+                try
+                {
+                    await refresh;
+                }
+                catch (OperationCanceledException)
+                {
+                }
+            }
+
             _done.TrySetResult();
         }
         catch (OperationCanceledException)
         {
             _done.TrySetCanceled(stoppingToken);
+        }
+        finally
+        {
+            if (_membership is not null)
+            {
+                await _membership.DisposeAsync();
+            }
+        }
+    }
+
+    public int OwnedPartitions => Volatile.Read(ref _owned);
+
+    private async Task RefreshFairShareAsync(CancellationToken ct)
+    {
+        using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+        do
+        {
+            try
+            {
+                var nodes = await _membership!.LiveNodesAsync(ct);
+                Volatile.Write(ref _fairShare, (source.Partitions + nodes - 1) / nodes);
+            }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                logger.LogWarning("Could not refresh the live node count: {Error}", ex.Message);
+            }
+        }
+        while (await timer.WaitForNextTickAsync(ct));
+    }
+
+    private bool TryYield()
+    {
+        var fair = Volatile.Read(ref _fairShare);
+        while (true)
+        {
+            var owned = Volatile.Read(ref _owned);
+            if (owned <= fair)
+            {
+                return false;
+            }
+
+            if (Interlocked.CompareExchange(ref _owned, owned - 1, owned) == owned)
+            {
+                return true;
+            }
         }
     }
 
@@ -181,6 +313,12 @@ public sealed class IngestEngine(
                     return;
                 }
 
+                if (Volatile.Read(ref _owned) >= Volatile.Read(ref _fairShare))
+                {
+                    await Task.Delay(o.LeaseRetryMs, ct);
+                    continue;
+                }
+
                 await using var lease = await PartitionLease.TryAcquireAsync(dataSource, partition, ct);
                 if (lease is null)
                 {
@@ -188,7 +326,24 @@ public sealed class IngestEngine(
                     continue;
                 }
 
-                await ConsumeAsync(partition, lease, ct);
+                Interlocked.Increment(ref _owned);
+                var released = false;
+                try
+                {
+                    released = await ConsumeAsync(partition, lease, ct);
+                }
+                finally
+                {
+                    if (!released)
+                    {
+                        Interlocked.Decrement(ref _owned);
+                    }
+                }
+
+                if (released)
+                {
+                    await Task.Delay(o.LeaseRetryMs, ct);
+                }
             }
             catch (Exception ex) when (!ct.IsCancellationRequested)
             {
@@ -199,13 +354,13 @@ public sealed class IngestEngine(
         }
     }
 
-    private async Task ConsumeAsync(int partition, PartitionLease lease, CancellationToken ct)
+    private async Task<bool> ConsumeAsync(int partition, PartitionLease lease, CancellationToken ct)
     {
         var o = options.Value;
         var start = await store.GetCheckpointAsync(partition, ct);
         if (start >= source.EndOffset)
         {
-            return;
+            return false;
         }
 
         var channel = Channel.CreateBounded<(long Offset, int Count, BatchAggregator Batch)>(new BoundedChannelOptions(2) { SingleReader = true, SingleWriter = true });
@@ -262,7 +417,14 @@ public sealed class IngestEngine(
                 {
                     throw new InvalidOperationException($"Lost the lease of partition {partition}.");
                 }
+
+                if (offset + count < source.EndOffset && TryYield())
+                {
+                    return true;
+                }
             }
+
+            return false;
         }
         finally
         {

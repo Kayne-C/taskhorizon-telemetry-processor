@@ -21,7 +21,25 @@ public class IngestTests(PostgresFixture pg)
     }
 
     private static async Task WaitDoneAsync(Node node, int seconds = 120)
-        => await node.Engine.Completion.WaitAsync(TimeSpan.FromSeconds(seconds));
+    {
+        try
+        {
+            await node.Engine.Completion.WaitAsync(TimeSpan.FromSeconds(seconds));
+        }
+        catch (TimeoutException)
+        {
+            var checkpoints = await Truth.ScalarAsync(node.DataSource, "SELECT sum(next_offset) FROM partition_checkpoints");
+            var locks = new List<string>();
+            await using var cmd = node.DataSource.CreateCommand("SELECT objid, pid, granted FROM pg_locks WHERE locktype = 'advisory' ORDER BY objid");
+            await using var r = await cmd.ExecuteReaderAsync();
+            while (await r.ReadAsync())
+            {
+                locks.Add($"{r.GetValue(0)}/pid{r.GetValue(1)}/{r.GetValue(2)}");
+            }
+
+            throw new TimeoutException($"owned={node.Engine.OwnedPartitions} events={node.Stats.Events} restarts={node.Stats.Restarts} checkpoints={checkpoints} locks=[{string.Join(", ", locks)}]");
+        }
+    }
 
     [Fact]
     public async Task Every_aggregate_equals_an_independent_computation_over_the_same_events()
@@ -54,7 +72,7 @@ public class IngestTests(PostgresFixture pg)
     public async Task Two_nodes_split_the_partitions_and_every_event_is_counted_exactly_once()
     {
         var db = await pg.CreateDatabaseAsync();
-        var options = new NodeOptions { Partitions = 8, EventsPerPartition = 150_000, BatchSize = 3_000 };
+        var options = new NodeOptions { Partitions = 8, EventsPerPartition = 150_000, BatchSize = 3_000, Faults = new SlowFaults(20) };
         var started = await Task.WhenAll(Node.StartAsync(db, options), Node.StartAsync(db, options));
         await using var a = started[0];
         await using var b = started[1];
@@ -65,6 +83,31 @@ public class IngestTests(PostgresFixture pg)
         await AssertMatchesTruthAsync(a);
         Assert.Equal(8 * 150_000, a.Stats.Events + b.Stats.Events);
         Assert.True(a.Stats.Events > 0 && b.Stats.Events > 0, $"work was not shared: {a.Stats.Events} / {b.Stats.Events}");
+    }
+
+    [Fact]
+    public async Task A_node_that_joins_later_takes_over_its_fair_share_of_partitions()
+    {
+        var db = await pg.CreateDatabaseAsync();
+        var options = new NodeOptions { Partitions = 8, EventsPerPartition = 400_000, BatchSize = 2_000, Faults = new SlowFaults(10) };
+        await using var a = await Node.StartAsync(db, options);
+        await Task.Delay(1_000);
+        Assert.True(a.Engine.OwnedPartitions >= 7, $"first node owns only {a.Engine.OwnedPartitions}");
+
+        await using var b = await Node.StartAsync(db, options);
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        while ((b.Stats.Events == 0 || a.Engine.OwnedPartitions > 4) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(50);
+        }
+
+        Assert.True(b.Stats.Events > 0, "the new node never received work");
+        Assert.InRange(a.Engine.OwnedPartitions, 1, 4);
+
+        await WaitDoneAsync(a);
+        await WaitDoneAsync(b);
+        await AssertMatchesTruthAsync(a);
+        Assert.Equal(8 * 400_000, a.Stats.Events + b.Stats.Events);
     }
 
     [Fact]

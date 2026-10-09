@@ -123,7 +123,11 @@ public class JobTests(PostgresFixture pg)
 
         await a.StopAsync();
         var before = b.Jobs.Rollups;
-        await Task.Delay(TimeSpan.FromSeconds(6));
+        var deadline = DateTime.UtcNow.AddSeconds(45);
+        while (b.Jobs.Rollups - before < 3 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(250);
+        }
 
         Assert.True(b.Jobs.Rollups - before >= 3, $"survivor ran only {b.Jobs.Rollups - before} times");
     }

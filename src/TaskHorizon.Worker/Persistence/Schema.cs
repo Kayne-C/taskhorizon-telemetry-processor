@@ -89,7 +89,7 @@ public static class Schema
                     await quartz.ExecuteNonQueryAsync(ct);
                 }
 
-                await using var marker = new NpgsqlCommand("CREATE TABLE schema_info (version int NOT NULL)", conn, tx);
+                await using var marker = new NpgsqlCommand("CREATE TABLE IF NOT EXISTS schema_info (version int NOT NULL)", conn, tx);
                 await marker.ExecuteNonQueryAsync(ct);
             }
 
@@ -109,7 +109,7 @@ public static class Schema
 
     private static async Task<bool> IsInstalledAsync(NpgsqlConnection conn, NpgsqlTransaction? tx, CancellationToken ct)
     {
-        await using var cmd = new NpgsqlCommand("SELECT to_regclass('schema_info') IS NOT NULL", conn, tx);
+        await using var cmd = new NpgsqlCommand("SELECT EXISTS (SELECT 1 FROM pg_class c WHERE c.relname = 'schema_info' AND c.relnamespace = current_schema()::regnamespace)", conn, tx);
         return await cmd.ExecuteScalarAsync(ct) is true;
     }
 }

@@ -65,6 +65,17 @@ public sealed class ChaosFaults(double beforeCommit = 0, double midCommit = 0, d
     }
 }
 
+public sealed class SlowFaults(int milliseconds) : IIngestFaults
+{
+    public void Hit(string point)
+    {
+        if (point == "before-commit")
+        {
+            Thread.Sleep(milliseconds);
+        }
+    }
+}
+
 public sealed record NodeOptions
 {
     public int Partitions { get; init; } = 4;

@@ -72,7 +72,7 @@ Quartz (kümelenmiş) ─▶ RollupJob · AlertJob · MaintenanceJob   (hepsi id
 dotnet test --solution TaskHorizon.slnx     # Docker gerekir (Testcontainers ile gerçek PostgreSQL 17)
 ```
 
-25 test: kaynak determinizmi, özet birleştirme (rastgele bölmelerle özellik testi), commit atomikliği, çit (fencing), çökme enjeksiyonu,
+26 test: kaynak determinizmi, özet birleştirme (rastgele bölmelerle özellik testi), commit atomikliği, çit (fencing), çökme enjeksiyonu,
 iki düğüm / düğüm ölümü, bölümleme, rollup, uyarılar, bakım, Quartz kümesi. Art arda 3 tam koşu geçti.
 
 **Testlerin bulduğu gerçek hata:** iki düğüm aynı anda ayağa kalkınca (biri veri alırken) şema kurulumu `CREATE ... IF NOT EXISTS` ile bile
