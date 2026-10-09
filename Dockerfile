@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1
 ARG PROJECT=TaskHorizon.Worker
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
