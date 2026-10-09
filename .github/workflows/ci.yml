@@ -30,6 +30,8 @@ jobs:
         run: dotnet build TaskHorizon.slnx -c Release --no-restore
 
       - name: Test
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
         run: dotnet test --solution TaskHorizon.slnx -c Release --no-build
 
       - name: Vulnerable packages (direct and transitive)
