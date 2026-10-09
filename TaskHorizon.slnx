@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TaskHorizon.Worker/TaskHorizon.Worker.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TaskHorizon.Tests/TaskHorizon.Tests.csproj" />
+  </Folder>
+</Solution>

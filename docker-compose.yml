@@ -1,0 +1,30 @@
+services:
+  postgres:
+    image: postgres:17
+    command: ["-c", "max_connections=200"]
+    environment:
+      POSTGRES_USER: taskhorizon
+      POSTGRES_PASSWORD: taskhorizon-dev-only
+      POSTGRES_DB: taskhorizon
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskhorizon"]
+      interval: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  worker-1: &worker
+    build: { context: . }
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["5401:8080"]
+    environment: &env
+      ConnectionStrings__Db: Host=postgres;Database=taskhorizon;Username=taskhorizon;Password=taskhorizon-dev-only
+      TaskHorizon__Ingest__EventsPerPartition: "20000000"
+
+  worker-2:
+    <<: *worker
+    ports: ["5402:8080"]
+
+volumes:
+  pgdata:
