@@ -1,95 +1,101 @@
-# TaskHorizon — Yüksek Hacimli Telemetri ve Arka Plan İş İşleyicisi
+# TaskHorizon — High-Volume Telemetry and Background Job Processor
 
-Milyonlarca IoT/ERP telemetri olayını **tam olarak bir kez** işleyip PostgreSQL'de dakika/saat bazında özetleyen, zamanlanmış işleri
-**Quartz.NET** (kümelenmiş, PostgreSQL destekli) ile yöneten bir Worker Service. .NET 10.
+**English** · [Türkçe](README.tr.md)
 
-Tasarımın merkezindeki soru: işleyici ortada ölürse, iki düğüm aynı partisyona saldırırsa ya da bir commit yarım kalırsa özetler
-yine de **birebir doğru** mu? Bu repo bunu, olayları bağımsız bir yoldan yeniden hesaplayıp veritabanıyla karşılaştırarak sınar.
+A Worker Service that processes millions of IoT/ERP telemetry events **exactly once**, aggregates them per minute and per hour in PostgreSQL, and runs scheduled jobs on a
+**clustered Quartz.NET** scheduler backed by PostgreSQL. .NET 10.
 
-## Neler yapıyor
+The question at the centre of the design: if a worker dies midway, two nodes go for the same partition, or a commit is cut in half, are the aggregates still **exactly right**?
+This repo tests that by recomputing the events through an independent path and comparing the result with the database.
 
-| Alan | Yaklaşım | Kanıt |
+## What it does
+
+| Area | Approach | Evidence |
 |---|---|---|
-| **Eşzamansız işleme** | Partisyon başına üretici/tüketici ayrımı: bir görev olayları okuyup bellekte özetler, sınırlı bir kanalla (2 parti) commit eden görevi besler. DB yazması sürerken sıradaki parti hazırlanır | Ölçüm: 8M olay 3,6 sn |
-| **Ön özetleme** | Olaylar `(cihaz, metrik, dakika)` anahtarıyla bellekte birleşir; DB'ye olay değil özet gider (`count, sum, min, max, sumsq`) | 40M olay → 1,37M satır (~29 kat azalma) |
-| **Tam bir kez etki** | Parti özetleri ve partisyon **checkpoint'i tek işlemde**: `UPDATE ... WHERE next_offset = @beklenen` (CAS) + upsert + commit. Çökünce checkpoint'ten yeniden okunur | Test: commit öncesi/sırası/sonrası %15'er rastgele çökme → özetler bağımsız hesapla **birebir eşit** |
-| **Çok düğüm** | Partisyon sahipliği PostgreSQL advisory lock ile; düğüm ölünce kilit düşer, diğeri devralır. CAS, kilidini kaybeden eski yazıcıyı (zombie) engeller | Test: 2 düğüm 8 partisyonu paylaşır, `düğüm A olayları + düğüm B olayları = toplam` (çift sayım yok); düğüm ortada durdurulur, diğeri bitirir |
-| **Geç/sırasız olaylar** | Dakika kovası olay zamanından; özetler birleştirilebilir (toplama, min/max), sıra önemsiz | Test: ±60 sn jitter, özet doğru |
-| **Zamanlanmış işler** | Quartz.NET, PostgreSQL job store, **kümelenmiş**: saatlik rollup, uyarı üretimi, bakım. Hepsi idempotent | Test: 2 düğüm, 6 sn'de ~6 çalıştırma (12 değil); bir düğüm düşünce diğeri sürdürür |
-| **Rollup** | Dakika → saat, `ON CONFLICT DO UPDATE` ile yeniden hesaplanır (artımlı değil), tekrar çalıştırmak sonucu değiştirmez | Test: saatler dakikaların toplamına eşit; geç gelen veri sonraki turda yansır |
-| **Uyarılar** | Eşik aşımı `UNIQUE(cihaz, metrik, kova, tür)` ile bir kez | Test: iş 3 kez çalışsa da her ani yükseliş tek uyarı |
-| **Bölümleme ve saklama** | `agg_minute` günlük aralık bölümlü; gerektiğinde oluşturulur (advisory lock ile yarışa karşı), süresi dolan bölüm `DROP` (satır silmek yok) | Test: eşzamanlı bölüm oluşturma, saklama süresi |
+| **Asynchronous processing** | Producer/consumer split per partition: one task reads events and aggregates them in memory, a bounded channel (2 batches) feeds the committing task. The next batch is prepared while the database write is in flight | Measured: 8M events in 3.6 s |
+| **Pre-aggregation** | Events merge in memory by `(device, metric, minute)`; the database receives summaries, not events (`count, sum, min, max, sumsq`) | 40M events → 1.37M rows (~29x fewer) |
+| **Exactly-once effect** | Batch summaries and the partition **checkpoint in one transaction**: `UPDATE ... WHERE next_offset = @expected` (compare-and-set) + upsert + commit. After a crash it re-reads from the checkpoint | Test: random crashes before / during / after commit (15% each) → summaries **exactly equal** to the independent computation |
+| **Multiple nodes** | Partition ownership through PostgreSQL advisory locks; when a node dies its locks are released and another takes over. The CAS keeps a stale writer (a zombie that lost its lock) out | Test: 2 nodes share 8 partitions, and `node A events + node B events = total` (no double counting); a node is stopped midway and the other finishes |
+| **Fair sharing** | Each node announces itself with a membership lock; the live node count gives a share of `ceil(partitions / nodes)`. A node holding more than its share releases partitions at a batch boundary | Test: the first node takes all 8 partitions, when the second joins the first drops to 4 and the second starts working; the total event count is still exact |
+| **Late / out-of-order events** | The minute bucket comes from event time; summaries are mergeable (sums, min/max), so order does not matter | Test: ±60 s jitter, summaries correct |
+| **Scheduled jobs** | Quartz.NET with a PostgreSQL job store, **clustered**: hourly rollup, alert generation, maintenance. All idempotent | Test: 2 nodes, ~6 runs in 6 s (not 12); when one node dies the other carries on |
+| **Rollup** | Minute → hour, recomputed with `ON CONFLICT DO UPDATE` (not incremental); running it again does not change the result | Test: hours equal the sum of their minutes; late data shows up in the next round |
+| **Alerts** | A threshold breach is raised once through `UNIQUE(device, metric, bucket, kind)` | Test: even if the job runs 3 times, each spike produces one alert |
+| **Partitioning and retention** | `agg_minute` is range-partitioned by day; partitions are created on demand (an advisory lock prevents races) and expired partitions are `DROP`ped (no row deletes) | Test: concurrent partition creation, retention |
 
-## Ölçüm
+## Measurements
 
-AMD Ryzen 7 9800X3D (8 çekirdek/16 iş parçacığı), Windows, PostgreSQL 17 **Docker içinde, varsayılan ayarlarla** (aynı makine), Release derleme,
-8 partisyon × cihaz başına 500, parti 50.000, aynı anda en çok 4 commit:
+AMD Ryzen 7 9800X3D (8 cores / 16 threads), Windows, PostgreSQL 17 **in Docker with default settings** (same machine), Release build,
+8 partitions × 500 devices each, batch size 50,000, at most 4 concurrent commits:
 
-| Veri | Süre | Verim | Ort. commit | Çıktı |
+| Data | Time | Throughput | Avg commit | Output |
 |---|---|---|---|---|
-| 8M olay | 3,6 sn | 2,19M olay/sn | 173 ms | 303 bin dakika satırı |
-| 40M olay | 16,7 sn | 2,39M olay/sn | 163 ms | 1,37M satır, 472 MB (indeksler dahil), toplam sayı tam 40.000.000 |
+| 8M events | 3.6 s | 2.19M events/s | 173 ms | 303k minute rows |
+| 40M events | 16.7 s | 2.39M events/s | 163 ms | 1.37M rows, 472 MB (with indexes), total count exactly 40,000,000 |
 
-Aynı veri üzerinde: saatlik rollup 1,37M satırı 48 bin saat satırına **1,3 sn**'de indirgiyor; uyarı taraması 117 ms.
+On the same data: the hourly rollup reduces 1.37M rows to 48k hourly rows in **1.3 s**; the alert scan takes 117 ms.
 
-**Bu sayıları doğru okumak için:** olay üreticisi ucuz ve aynı süreçte (bir mesaj kuyruğundan ağ üzerinden okumak ve JSON/protobuf ayrıştırmak bu rakamı belirgin düşürür);
-PostgreSQL ve uygulama aynı makinede ve CPU paylaşıyor; tek veritabanı örneği, tek düğüm. Rakam "bu tasarımda DB tarafı darboğaz değil, ön özetleme işe yarıyor"
-demektir, "üretimde saniyede 2 milyon olay" demek değildir.
+**How to read these numbers:** the event generator is cheap and in-process (reading from a message queue over the network and parsing JSON/protobuf would lower this considerably);
+PostgreSQL and the application share one machine and CPU; one database instance, one node. The figure means "in this design the database side is not the bottleneck and pre-aggregation works",
+not "two million events per second in production".
 
-## Hızlı başlangıç
+## Quick start
 
 ```bash
-docker compose up -d --build        # PostgreSQL + 2 worker düğümü (aynı veritabanı, aynı Quartz kümesi)
-curl localhost:5401/stats           # ilerleme, olay/sn, partisyon checkpoint'leri
+docker compose up -d --build        # PostgreSQL + 2 worker nodes (same database, same Quartz cluster)
+curl localhost:5401/stats           # progress, events/s, partition checkpoints
 curl "localhost:5401/devices/3/minutes?metric=0&limit=5"
 curl localhost:5401/alerts
 ```
 
-Docker'sız karşılaştırma ölçümü: `dotnet run --project src/TaskHorizon.Worker -c Release -- --bench` (bir PostgreSQL bağlantısı gerekir,
-`ConnectionStrings__Db` ortam değişkeniyle verilir). Tüm olaylar işlenince verim özetini yazıp çıkar.
+A comparison run without Docker: `dotnet run --project src/TaskHorizon.Worker -c Release -- --bench` (needs a PostgreSQL connection, passed through the
+`ConnectionStrings__Db` environment variable). When all events are processed it prints a throughput summary and exits.
 
-Değerler tamsayı **santi-birim**dir (45,00 → 4500). Toplamların ve kareler toplamının (varyans için) kayan nokta hatasıyla değil
-birebir doğru olması bunun sayesindedir.
+Values are integer **centi-units** (45.00 → 4500). That is what keeps the sums and the sum of squares (for variance) exact, free of floating-point error.
 
-## Mimari
+## Architecture
 
 ```
-Kaynak (partisyon p, offset o) ── okuma+özetleme görevi ─▶ [kanal, 2 parti] ─▶ commit görevi ─▶ PostgreSQL
-   saf fonksiyon: aynı (p,o) → aynı olay                                          tek işlem:
-                                                                                  1) checkpoint CAS   (kilit/çit)
-                                                                                  2) agg_minute upsert (birleştirerek)
+Source (partition p, offset o) ── read+aggregate task ─▶ [channel, 2 batches] ─▶ commit task ─▶ PostgreSQL
+   pure function: same (p,o) → same event                                          one transaction:
+                                                                                  1) checkpoint CAS   (lock/fence)
+                                                                                  2) agg_minute upsert (merging)
                                                                                   3) commit
-Quartz (kümelenmiş) ─▶ RollupJob · AlertJob · MaintenanceJob   (hepsi idempotent)
+Quartz (clustered) ─▶ RollupJob · AlertJob · MaintenanceJob   (all idempotent)
 ```
 
-- Bir cihaz her zaman aynı partisyondadır (anahtara göre bölümleme, Kafka'daki gibi). Bu yüzden iki partisyon aynı satırı güncellemez, kilit çekişmesi/deadlock olmaz.
-  Satırlar birincil anahtar sırasıyla yazılır.
-- Kararlar: [docs/adr](docs/adr).
+- A device always lives in the same partition (partitioning by key, as in Kafka). Two partitions therefore never update the same row: no lock contention, no deadlock.
+  Rows are written in primary-key order.
+- Decisions: [docs/adr/en](docs/adr/en).
 
-## Testler
+## Tests
 
 ```bash
-dotnet test --solution TaskHorizon.slnx     # Docker gerekir (Testcontainers ile gerçek PostgreSQL 17)
+dotnet test --solution TaskHorizon.slnx     # needs Docker (real PostgreSQL 17 via Testcontainers)
 ```
 
-26 test: kaynak determinizmi, özet birleştirme (rastgele bölmelerle özellik testi), commit atomikliği, çit (fencing), çökme enjeksiyonu,
-iki düğüm / düğüm ölümü, bölümleme, rollup, uyarılar, bakım, Quartz kümesi. Art arda 3 tam koşu geçti.
+26 tests: source determinism, summary merging (a property test with random splits), commit atomicity, fencing, crash injection,
+two nodes / node death / a late-joining node, partitioning, rollup, alerts, maintenance, the Quartz cluster. Five consecutive full runs passed, and the late-joiner test alone passed 10 times in a row.
 
-**Testlerin bulduğu gerçek hata:** iki düğüm aynı anda ayağa kalkınca (biri veri alırken) şema kurulumu `CREATE ... IF NOT EXISTS` ile bile
-tablolarda kilit alıyor, ve çalışan yazımlarla **deadlock** oluşuyordu. Çözüm: kurulum bir sürüm tablosuyla korunur, zaten kuruluysa hiçbir DDL çalışmaz;
-ilk kurulum advisory lock ile tek düğümde yapılır.
+**A real bug the tests found:** when two nodes start at the same time (one already ingesting), the schema installer took locks on tables even with `CREATE ... IF NOT EXISTS`,
+and **deadlocked** with the running writes. The fix: installation is guarded by a version table, no DDL runs when it is already installed,
+and the first install happens on a single node under an advisory lock.
 
-## Bilinen sınırlar (dürüst liste)
+**A second real bug:** when fair sharing was first written, the live node count was queried concurrently from 8 partition tasks over one connection
+(an Npgsql connection is not thread-safe). In about one run in six this caused thousands of restarts a second and stalls; the count now runs in a single background loop.
 
-- Kaynak, **tekrar oynatılabilir sentetik bir günlük** (partisyon + offset ile saf fonksiyon). "Tam bir kez" garantisi tam olarak buna dayanır: kaynaktan aynı offset'ten tekrar okuyabilmek.
-  Gerçek bir Kafka/MQTT/Event Hubs bağdaştırıcısı **yazılmadı**; offset'i olan bir aracıyla aynı model uygulanır, ama denenmedi.
-- Yüzdelik dilimler (p95, p99) desteklenmez: birleştirilebilir değiller. Sayı/toplam/min/maks/kareler toplamı (ortalama ve standart sapma) var.
-- Rollup yalnızca son `RollupLookbackHours` saatini yeniden hesaplar; daha eski geç veri için `RollupService.RunAllAsync` elle çağrılmalı (uç nokta yok).
-- Saklama süresi duvar saatine değil **en yeni verinin zamanına** göre hesaplanır (sentetik veri geçmişte olduğu için).
-- Partisyon sayısı ilk veriden sonra değiştirilemez: cihaz → partisyon eşlemesi bozulur ve "iki partisyon aynı satıra yazmaz" varsayımı çöker. Yeniden bölümleme araçları yok.
-- Sahiplik için advisory lock kullanılıyor; işlem havuzlama modundaki PgBouncer ile **uyumsuz** (oturum kilidi).
-- Quartz şeması, Quartz'ın resmî PostgreSQL betiğinden (sürüm 4.4.0 ile aynı depo) alınıp gömüldü; Quartz sürümü yükseltilirse betik yeniden eşitlenmeli.
-  Kümeleme iki **süreç içi** düğümle (aynı veritabanı) test edildi, ayrı makinelerde değil.
-- Uyarılar yalnızca tabloya yazılır; bildirim kanalı (e-posta, webhook) yok.
-- API'de kimlik doğrulama yok. Sonsuz akış modu yok: `EventsPerPartition` sonlu.
-- Verim ölçümü yukarıdaki kısıtlarla tek makinede yapıldı; çok düğümlü ölçekleme verimi ölçülmedi.
+## Known limits (an honest list)
+
+- The source is a **replayable synthetic log** (a pure function of partition + offset). The "exactly once" guarantee rests exactly on that: being able to read the same offset again.
+  A real Kafka/MQTT/Event Hubs adapter was **not written**; the same model applies to a broker with offsets, but it was not tried.
+- Percentiles (p95, p99) are not supported: they cannot be merged. Count, sum, min, max and sum of squares (so mean and standard deviation) are.
+- The rollup recomputes only the last `RollupLookbackHours` hours; for older late data `RollupService.RunAllAsync` has to be called by hand (no endpoint).
+- Retention is computed from the **timestamp of the newest data**, not the wall clock (because the synthetic data is in the past).
+- The partition count cannot be changed after the first data: the device → partition mapping breaks and the "two partitions never write the same row" assumption collapses. There is no repartitioning tool.
+- Fair sharing is a simple `ceil(P / nodes)` rule; no weighted nodes, capacity-aware placement or hot-partition balancing.
+- Ownership uses advisory locks, which are **incompatible** with PgBouncer in transaction-pooling mode (they are session locks).
+- The Quartz schema was taken from Quartz's official PostgreSQL script (same repository, version 4.4.0) and embedded; if Quartz is upgraded the script must be re-synced.
+  Clustering was tested with two **in-process** nodes (same database), not on separate machines.
+- Alerts are only written to a table; there is no notification channel (e-mail, webhook).
+- The API has no authentication. There is no endless-stream mode: `EventsPerPartition` is finite.
+- Throughput was measured on one machine under the constraints above; multi-node scaling throughput was not measured.
